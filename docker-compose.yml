@@ -1,0 +1,224 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      CHIRPSTACK_DB_PASSWORD: ${CHIRPSTACK_DB_PASSWORD}
+      IOT_DB_PASSWORD: ${IOT_DB_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./infra/postgres/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - iot-backend
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - iot-backend
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    environment:
+      MQTT_CHIRPSTACK_PASSWORD: ${MQTT_CHIRPSTACK_PASSWORD}
+      MQTT_ZIGBEE_PASSWORD: ${MQTT_ZIGBEE_PASSWORD}
+      MQTT_THREAD_PASSWORD: ${MQTT_THREAD_PASSWORD}
+      MQTT_BACKEND_PASSWORD: ${MQTT_BACKEND_PASSWORD}
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./infra/mosquitto/acl:/mosquitto/config/acl:ro
+      - ./infra/mosquitto/entrypoint.sh:/entrypoint.sh:ro
+      - mosquitto_data:/mosquitto/data
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -h localhost -u core_backend -P ${MQTT_BACKEND_PASSWORD} -t healthcheck -m ok || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - iot-backend
+
+  chirpstack-gateway-bridge:
+    image: chirpstack/chirpstack-gateway-bridge:4
+    restart: unless-stopped
+    environment:
+      INTEGRATION__MQTT__EVENT_TOPIC_TEMPLATE: "eu868/gateway/{{ .GatewayID }}/event/{{ .EventType }}"
+      INTEGRATION__MQTT__STATE_TOPIC_TEMPLATE: "eu868/gateway/{{ .GatewayID }}/state/{{ .StateType }}"
+      INTEGRATION__MQTT__COMMAND_TOPIC_TEMPLATE: "eu868/gateway/{{ .GatewayID }}/command/#"
+      INTEGRATION__MQTT__AUTH__TYPE: generic
+      INTEGRATION__MQTT__AUTH__GENERIC__SERVERS: tcp://mosquitto:1883
+      INTEGRATION__MQTT__AUTH__GENERIC__USERNAME: chirpstack
+      INTEGRATION__MQTT__AUTH__GENERIC__PASSWORD: ${MQTT_CHIRPSTACK_PASSWORD}
+      BACKEND__TYPE: semtech_udp
+      BACKEND__SEMTECH_UDP__UDP_BIND: 0.0.0.0:1700
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    networks:
+      - iot-backend
+
+  chirpstack:
+    image: chirpstack/chirpstack:4
+    restart: unless-stopped
+    command: -c /etc/chirpstack
+    ports:
+      - "8080:8080"
+    environment:
+      CHIRPSTACK_DB_PASSWORD: ${CHIRPSTACK_DB_PASSWORD}
+      CHIRPSTACK_API_SECRET: ${CHIRPSTACK_API_SECRET}
+      MQTT_CHIRPSTACK_PASSWORD: ${MQTT_CHIRPSTACK_PASSWORD}
+    volumes:
+      - ./infra/chirpstack:/etc/chirpstack:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    networks:
+      - iot-backend
+
+  provisioner:
+    build: ./services/provisioner
+    restart: "no"
+    environment:
+      CHIRPSTACK_SERVER: chirpstack:8080
+      CHIRPSTACK_API_SECRET: ${CHIRPSTACK_API_SECRET}
+      CHIRPSTACK_ADMIN_EMAIL: ${CHIRPSTACK_ADMIN_EMAIL}
+      CHIRPSTACK_ADMIN_PASSWORD: ${CHIRPSTACK_ADMIN_PASSWORD}
+      CODEC_PATH: /config/codec.js
+      SHARED_DIR: /shared
+    volumes:
+      - ./infra/chirpstack/codec.js:/config/codec.js:ro
+      - shared_provisioning:/shared
+    depends_on:
+      chirpstack:
+        condition: service_started
+    networks:
+      - iot-backend
+
+  lorawan-sim:
+    build: ./services/lorawan-sim
+    restart: unless-stopped
+    environment:
+      GATEWAY_BRIDGE_HOST: chirpstack-gateway-bridge
+      GATEWAY_BRIDGE_PORT: 1700
+      SHARED_DIR: /shared
+      CONTROL_PORT: 8091
+    volumes:
+      - shared_provisioning:/shared:ro
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+      chirpstack-gateway-bridge:
+        condition: service_started
+    networks:
+      - iot-backend
+
+  zigbee-sim:
+    build: ./services/zigbee-sim
+    restart: unless-stopped
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      MQTT_USER: zigbee_coord
+      MQTT_PASSWORD: ${MQTT_ZIGBEE_PASSWORD}
+      CONTROL_PORT: 8092
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    networks:
+      - iot-backend
+
+  thread-sim:
+    build: ./services/thread-sim
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      MQTT_USER: thread_bridge
+      MQTT_PASSWORD: ${MQTT_THREAD_PASSWORD}
+      IPV6_PREFIX: "fd00:db8:1::"
+      CONTROL_PORT: 8093
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    networks:
+      iot-backend:
+      iot-thread-net:
+        ipv6_address: fd00:db8:1::10
+
+  core-backend:
+    build: ./services/core-backend
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_API_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql://iot_user:${IOT_DB_PASSWORD}@postgres:5432/iot_platform
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      MQTT_USER: core_backend
+      MQTT_PASSWORD: ${MQTT_BACKEND_PASSWORD}
+      CHIRPSTACK_SERVER: chirpstack:8080
+      CHIRPSTACK_API_SECRET: ${CHIRPSTACK_API_SECRET}
+      SHARED_DIR: /shared
+      THREAD_IPV6_PREFIX: "fd00:db8:1::"
+    volumes:
+      - shared_provisioning:/shared:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+      provisioner:
+        condition: service_completed_successfully
+    networks:
+      iot-backend:
+      iot-thread-net:
+        ipv6_address: fd00:db8:1::2
+
+  dashboard:
+    build: ./services/dashboard
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-3000}:80"
+    depends_on:
+      core-backend:
+        condition: service_started
+    networks:
+      - iot-backend
+
+volumes:
+  pg_data:
+  redis_data:
+  mosquitto_data:
+  shared_provisioning:
+
+networks:
+  iot-backend:
+    driver: bridge
+  iot-thread-net:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: fd00:db8:1::/64

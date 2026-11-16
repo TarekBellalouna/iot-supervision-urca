@@ -1,0 +1,17 @@
+user chirpstack
+topic readwrite eu868/#
+topic readwrite application/#
+
+user zigbee_coord
+topic readwrite zigbee2mqtt/#
+
+user thread_bridge
+topic write iot/v1/thread/+/telemetry
+topic write iot/v1/thread/+/status
+
+user core_backend
+topic read application/+/device/+/event/up
+topic write application/+/device/+/command/down
+topic read zigbee2mqtt/#
+topic write zigbee2mqtt/+/get
+topic readwrite iot/v1/#
